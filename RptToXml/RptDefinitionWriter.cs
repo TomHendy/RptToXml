@@ -22,7 +22,9 @@ namespace RptToXml
 {
 	public partial class RptDefinitionWriter : IDisposable
 	{
-		private const FormatTypes ShowFormatTypes = FormatTypes.AreaFormat | FormatTypes.SectionFormat | FormatTypes.Color;
+		// FormatTypes used to be declared with '^' (XOR) instead of powers of two, which made every
+		// (ShowFormatTypes & X) == X check true; All keeps the output that produced.
+		private const FormatTypes ShowFormatTypes = FormatTypes.All;
 
 		private ReportDocument _report;
 		private ISCDReportClientDocument _rcd;
@@ -55,33 +57,39 @@ namespace RptToXml
 
 		public void WriteToXml()
 		{
-			XmlWriterSettings settings = new XmlWriterSettings
-            {
-                CheckCharacters = true,
-                Encoding = Encoding.UTF8,
-                Indent = true
-            };
-
-            StringBuilder stringOutput = new StringBuilder();
-			using (XmlWriter writer = XmlWriter.Create(stringOutput, settings))
+			// Buffer the whole document so a failure part-way through writes nothing to stdout, then copy the
+			// UTF-8 bytes (no BOM, matching the encoding="utf-8" declaration) to the raw standard output stream,
+			// bypassing the console code page (this is the git textconv path).
+			using (var buffer = new System.IO.MemoryStream())
 			{
-				WriteToXml(writer);
+				WriteToXml(buffer, new UTF8Encoding(false));
+
+				System.IO.Stream stdout = Console.OpenStandardOutput();
+				buffer.WriteTo(stdout);
+				stdout.Flush();
 			}
-			Trace.Write(stringOutput.ToString());
 		}
 
         public void WriteToXml(string targetXmlPath)
         {
-            WriteToXml(System.IO.File.Create(targetXmlPath));
+            using (System.IO.Stream output = System.IO.File.Create(targetXmlPath))
+            {
+                WriteToXml(output);
+            }
         }
 
 		public void WriteToXml(System.IO.Stream output)
+		{
+			WriteToXml(output, Encoding.UTF8);
+		}
+
+		private void WriteToXml(System.IO.Stream output, Encoding encoding)
 		{
 
 			XmlWriterSettings settings = new XmlWriterSettings
             {
                 CheckCharacters = true,
-                Encoding = Encoding.UTF8,
+                Encoding = encoding,
                 Indent = true
             };
             using (XmlWriter writer = XmlWriter.Create(output, settings))
@@ -103,8 +111,10 @@ namespace RptToXml
 			writer.Flush();
 		}
 
+		// Matches characters that are not legal in XML 1.0: unpaired surrogates and anything outside
+		// #x9 | #xA | #xD | [#x20-#xFFFD]. Well-formed surrogate pairs (#x10000-#x10FFFF) are kept.
 		private static readonly System.Text.RegularExpressions.Regex CompiledRegexp =
-			new System.Text.RegularExpressions.Regex("[^\\u0009\\u000a\\u000d\\u0020-\\uD7FF\\uE000-\\uFFFD]",
+			new System.Text.RegularExpressions.Regex("[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]|[^\\u0009\\u000a\\u000d\\u0020-\\uFFFD]",
 				System.Text.RegularExpressions.RegexOptions.Compiled);
 
 		private static void WriteAttributeString(XmlWriter writer, string name, string value)
@@ -116,6 +126,84 @@ namespace RptToXml
 		{
 			string myValue = value == null ? null : CompiledRegexp.Replace(value, "");
 			writer.WriteString(myValue ?? "");
+		}
+		private static void WriteElementString(XmlWriter writer, string localName, string value)
+		{
+			// same shape as XmlWriter.WriteElementString (empty element for null/""), but sanitized
+			writer.WriteStartElement(localName);
+			if (!String.IsNullOrEmpty(value))
+			{
+				WriteString(writer, value);
+			}
+			writer.WriteEndElement();
+		}
+
+		// Writes one element subtree into a detached buffer and copies it to writer only if write completes, so an exception
+		// part-way through cannot leave elements open in the main document.
+		// XElement.WriteTo replays the buffered calls through writer, so its settings (indentation, escaping, newlines, character
+		// checks) apply and the bytes match a direct write, provided no element mixes text with child elements or splits its
+		// text over several WriteString calls (the buffer merges adjacent text and drops empty text beside child elements);
+		// nothing in this class does either.
+		private static void WriteBuffered(XmlWriter writer, Action<XmlWriter> write)
+		{
+			var buffer = new System.Xml.Linq.XDocument();
+			using (XmlWriter bufferWriter = buffer.CreateWriter()) // the written nodes reach buffer when bufferWriter is closed
+			{
+				write(bufferWriter);
+			}
+			buffer.Root?.WriteTo(writer);
+		}
+
+		// Reads a name for an error message or marker element; the object that just failed may fail again here, including with
+		// the corrupted-state exception (such as an access violation) that GetSubreports catches, hence the attribute.
+		[HandleProcessCorruptedStateExceptions]
+		private static string TryGetName(Func<string> getName)
+		{
+			try
+			{
+				return getName();
+			}
+			catch (Exception)
+			{
+				return null;
+			}
+		}
+
+		// Writes one element subtree for data that earlier versions of this tool did not dump. If reading it fails, the subtree
+		// is left out and the failure reported, so the rest of the report is still dumped as it was before the subtree existed.
+		[HandleProcessCorruptedStateExceptions]
+		private static void WriteOptional(XmlWriter writer, string description, Action<XmlWriter> write)
+		{
+			try
+			{
+				WriteBuffered(writer, write);
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine($"Error reading {description}, {e.Message}");
+			}
+		}
+
+		// Writes an attribute whose value earlier versions of this tool did not read from the report. If reading it fails,
+		// the failure is reported and the attribute left out, so the rest of the element is still written as before.
+		[HandleProcessCorruptedStateExceptions]
+		private static void WriteOptionalAttribute(XmlWriter writer, string name, string description, Func<string> read)
+		{
+			string value;
+			try
+			{
+				value = read();
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine($"Error reading {description}, {e.Message}");
+				return;
+			}
+
+			if (value != null)
+			{
+				WriteAttributeString(writer, name, value);
+			}
 		}
 
         //This is a recursive method.  GetSubreports() calls it.
@@ -136,7 +224,11 @@ namespace RptToXml
                     Trace.WriteLine("Writing header info");
                 }
 
-                WriteAttributeString(writer, "FileName", report.FileName.Replace("rassdk://", ""));
+                // left out with --stdout (the git textconv path): git passes a temporary copy, so the name would change in every diff
+                if (!_stdOut)
+                {
+                    WriteAttributeString(writer, "FileName", report.FileName.Replace("rassdk://", ""));
+                }
 				WriteAttributeString(writer, "HasSavedData", report.HasSavedData.ToString());
 
 				if (_oleCompoundFile != null)
@@ -268,16 +360,31 @@ namespace RptToXml
 		{
 			writer.WriteStartElement("SubReports");
 
+			// The outer try covers enumerating report.Subreports, which can itself throw (issue #47). Each subreport is written
+			// through WriteBuffered, so one that fails part-way through is replaced by a marker element instead of leaving its
+			// elements open, and the remaining subreports are still written.
 			try
 			{
 				foreach (ReportDocument subreport in report.Subreports)
-                {
-                    ProcessReport(subreport, writer);
-                }
-            }
+				{
+					try
+					{
+						WriteBuffered(writer, w => ProcessReport(subreport, w));
+					}
+					catch (Exception e)
+					{
+						string name = TryGetName(() => subreport.Name);
+						Console.Error.WriteLine($"Error processing subreport '{name}', {e}");
+						writer.WriteStartElement("Report");
+						WriteAttributeString(writer, "Name", name);
+						WriteAttributeString(writer, "Error", e.GetType().Name); // not the message, which can name a temporary file
+						writer.WriteEndElement();
+					}
+				}
+			}
 			catch (Exception e)
 			{
-				Console.WriteLine($"Error loading subpreport, {e}");
+				Console.Error.WriteLine($"Error loading subreport, {e}");
 			}
 			writer.WriteEndElement();
 		}
@@ -336,9 +443,17 @@ namespace RptToXml
 		{
 			writer.WriteStartElement("CustomFunctions");
 
-            // TODO:
-            // var subrptClientDoc = _report.ReportClientDocument.SubreportController.GetSubreport(report.Name);
-            // funcs = subrptClientDoc.CustomFunctionController.GetCustomFunctions();
+            // Custom functions can only be read for the main report. The sole RAS accessor is
+            // ISCDReportClientDocument.CustomFunctionController.GetCustomFunctions(), which takes no
+            // subreport name. For a subreport, report.ReportClientDocument is the engine's SubreportWrapper,
+            // whose CustomFunctionController getter throws NotSupportedException ("not supported by
+            // subreport"); the RAS document from SubreportController.GetSubreport(name)
+            // (ISCRSubreportClientDocument) has no CustomFunctionController, and neither its Document
+            // (ReportDefModel.ReportDocument) nor DataDefModel.DataDefinition exposes custom functions.
+            // So a subreport always gets an empty <CustomFunctions/> (kept for schema stability), which
+            // does not mean the subreport defines none.
+            // RAS CustomFunction exposes only Name, Syntax and Text (plus ClassName, the RAS object type name);
+            // return type and arguments are part of Text, while summary/category/author are not exposed.
             CRDataDefModel.CustomFunctions funcs = !report.IsSubreport
                 ? report.ReportClientDocument.CustomFunctionController.GetCustomFunctions()
                 : null;
@@ -350,7 +465,7 @@ namespace RptToXml
 					writer.WriteStartElement("CustomFunction");
 					WriteAttributeString(writer, "Name", func.Name);
 					WriteAttributeString(writer, "Syntax", func.Syntax.ToString());
-					writer.WriteElementString("Text", func.Text); // an element so line breaks are literal
+					WriteElementString(writer, "Text", func.Text); // an element so line breaks are literal
 
 					writer.WriteEndElement();
 				}
@@ -391,16 +506,27 @@ namespace RptToXml
 			WriteAttributeString(writer, "Name", table.Name);
 
 			writer.WriteStartElement("ConnectionInfo");
+			// a property that is itself a property bag is written as a Property element after the attributes
+			var nestedProperties = new System.Collections.Generic.List<PropertyBagEntry>();
 			foreach (string propertyId in table.ConnectionInfo.Attributes.PropertyIDs)
 			{
+				object value = table.ConnectionInfo.Attributes[propertyId];
+				PropertyBagEntry nestedProperty = TryReadNestedProperty(table.Alias, propertyId, value);
+				if (nestedProperty != null)
+				{
+					nestedProperties.Add(nestedProperty);
+					continue;
+				}
+
 				// make attribute name safe for XML
 				string attributeName = propertyId.Replace(" ", "_");
 
-				WriteAttributeString(writer, attributeName, table.ConnectionInfo.Attributes[propertyId].ToString());
+				WriteAttributeString(writer, attributeName, value.ToString());
 			}
 
 			WriteAttributeString(writer, "UserName", table.ConnectionInfo.UserName);
 			WriteAttributeString(writer, "Password", table.ConnectionInfo.Password);
+			WritePropertyBagEntries(writer, "Property", nestedProperties.ToArray());
 			writer.WriteEndElement();
 
             if (table is CRDataDefModel.CommandTable commandTable)
@@ -455,18 +581,52 @@ namespace RptToXml
 			writer.WriteEndElement();
 		}
 
+		[HandleProcessCorruptedStateExceptions]
 		private void GetDataDefinition(ReportDocument report, XmlWriter writer)
 		{
 			writer.WriteStartElement("DataDefinition");
 
-			writer.WriteElementString("GroupSelectionFormula", report.DataDefinition.GroupSelectionFormula);
-			writer.WriteElementString("RecordSelectionFormula", report.DataDefinition.RecordSelectionFormula);
+			WriteElementString(writer, "GroupSelectionFormula", report.DataDefinition.GroupSelectionFormula);
+			WriteElementString(writer, "RecordSelectionFormula", report.DataDefinition.RecordSelectionFormula);
 
 			writer.WriteStartElement("Groups");
+			// engine and RAS groups are both in group-level order; pair them by index (see GetRASDDMGroups)
+			CRDataDefModel.Groups ddmGroups = null;
+			try
+			{
+				ddmGroups = GetRASDDMGroups(report);
+				int groupCount = report.DataDefinition.Groups.Count;
+				int rasGroupCount = ddmGroups?.Count ?? 0;
+				if (rasGroupCount != groupCount)
+				{
+					ddmGroups = null; // cannot pair them reliably, so write no options rather than wrong ones
+					Console.Error.WriteLine($"Error reading group options of {DescribeReport(report)}, it has {groupCount} groups and RAS has {rasGroupCount}");
+				}
+			}
+			catch (Exception e)
+			{
+				ddmGroups = null; // not checked against the engine's groups, so do not pair them
+				Console.Error.WriteLine($"Error reading group options of {DescribeReport(report)}, {e.Message}");
+			}
+			int groupIndex = 0;
 			foreach (Group group in report.DataDefinition.Groups)
 			{
 				writer.WriteStartElement("Group");
-				WriteAttributeString(writer, "ConditionField", group.ConditionField.FormulaName);
+				string conditionFieldName = group.ConditionField.FormulaName;
+				WriteAttributeString(writer, "ConditionField", conditionFieldName);
+
+				if (ddmGroups != null)
+				{
+					int index = groupIndex;
+					string groupDescription = $"group {conditionFieldName} in {DescribeReport(report)}";
+					WriteOptional(writer, $"options of {groupDescription}", w =>
+					{
+						CRDataDefModel.Group ddmGroup = ddmGroups[index];
+						CheckRASField(ddmGroup.ConditionField, conditionFieldName, $"the RAS group at position {index + 1}");
+						GetGroupOptions(ddmGroup.Options, groupDescription, w);
+					});
+				}
+				groupIndex++;
 
 				writer.WriteEndElement();
 
@@ -474,6 +634,7 @@ namespace RptToXml
 			writer.WriteEndElement();
 
 			writer.WriteStartElement("SortFields");
+			int sortIndex = 0;
 			foreach (SortField sortField in report.DataDefinition.SortFields)
 			{
 				writer.WriteStartElement("SortField");
@@ -487,6 +648,14 @@ namespace RptToXml
 				catch (NotSupportedException)
 				{ }
 				WriteAttributeString(writer, "SortType", sortField.SortType.ToString());
+
+				if (sortField is TopBottomNSortField)
+				{
+					int index = sortIndex;
+					string sortFieldName = sortField.Field.FormulaName;
+					WriteOptional(writer, $"TopN sort of {sortFieldName} in {DescribeReport(report)}", w => GetTopNSort(report, index, sortFieldName, w));
+				}
+				sortIndex++;
 
 				writer.WriteEndElement();
 			}
@@ -509,16 +678,30 @@ namespace RptToXml
             writer.WriteEndElement();
 
 			writer.WriteStartElement("ParameterFieldDefinitions");
+			// As in GetSubreports: the outer try covers enumerating the parameters, and each parameter is written through
+			// WriteBuffered, so one that fails part-way through is replaced by a marker element and the rest are still written.
 			try
 			{
 				foreach (var field in report.DataDefinition.ParameterFields)
-                {
-                    GetFieldObject(field, report, writer);
-                }
-            }
+				{
+					try
+					{
+						WriteBuffered(writer, w => GetFieldObject(field, report, w));
+					}
+					catch (Exception e)
+					{
+						string name = TryGetName(() => (field as ParameterFieldDefinition)?.Name);
+						Console.Error.WriteLine($"Error processing parameter '{name}', {e}");
+						writer.WriteStartElement("ParameterFieldDefinition");
+						WriteAttributeString(writer, "Name", name);
+						WriteAttributeString(writer, "Error", e.GetType().Name); // not the message, which can name a temporary file
+						writer.WriteEndElement();
+					}
+				}
+			}
 			catch (Exception e)
 			{
-				Console.WriteLine($"Error processing ParameterFieldDefinitions, {e}");
+				Console.Error.WriteLine($"Error processing ParameterFieldDefinitions, {e}");
 			}
 			writer.WriteEndElement();
 
@@ -589,7 +772,7 @@ namespace RptToXml
 				try
 				{
 					WriteAttributeString(writer, "FormulaName", gnf.FormulaName);
-					WriteAttributeString(writer, "Group", gnf.Group.ToString());
+					WriteOptionalAttribute(writer, "Group", "Group of a group name field", () => GetGroupReference(gnf.Group));
 					WriteAttributeString(writer, "GroupNameFieldName", gnf.GroupNameFieldName);
 					WriteAttributeString(writer, "Kind", gnf.Kind.ToString());
 					WriteAttributeString(writer, "Name", gnf.Name);
@@ -598,7 +781,7 @@ namespace RptToXml
 				}
 				catch (Exception e)
 				{
-					Console.WriteLine($"Error loading formula for group '{gnf.GroupNameFieldName}', {e}");
+					Console.Error.WriteLine($"Error loading formula for group '{TryGetName(() => gnf.GroupNameFieldName)}', {e}");
 				}
 			}
 			else if (fo is ParameterFieldDefinition pf)
@@ -617,9 +800,13 @@ namespace RptToXml
 				}
 				else
 				{
-					var ddm_pf = GetRASDDMParameterFieldObject(pf.Name, report);
+					var ddm_pf = GetRASDDMParameterFieldObject(pf, report);
 
 					WriteAttributeString(writer, "AllowCustomCurrentValues", (ddm_pf != null && ddm_pf.AllowCustomCurrentValues).ToString());
+					WriteParameterSettingAttribute(writer, pf.Name, "DefaultValueDisplayType", () => pf.DefaultValueDisplayType.ToString());
+					WriteParameterSettingAttribute(writer, pf.Name, "DefaultValueSortMethod", () => pf.DefaultValueSortMethod.ToString());
+					WriteParameterSettingAttribute(writer, pf.Name, "DefaultValueSortOrder", () => pf.DefaultValueSortOrder.ToString());
+					WriteParameterSettingAttribute(writer, pf.Name, "DiscreteOrRangeKind", () => pf.DiscreteOrRangeKind.ToString());
 					WriteAttributeString(writer, "EditMask", pf.EditMask);
 					WriteAttributeString(writer, "EnableAllowEditingDefaultValue", pf.EnableAllowEditingDefaultValue.ToString());
 					WriteAttributeString(writer, "EnableAllowMultipleValue", pf.EnableAllowMultipleValue.ToString());
@@ -628,8 +815,8 @@ namespace RptToXml
 					WriteAttributeString(writer, "HasCurrentValue", pf.HasCurrentValue.ToString());
 					WriteAttributeString(writer, "IsOptionalPrompt", pf.IsOptionalPrompt.ToString());
 					WriteAttributeString(writer, "Kind", pf.Kind.ToString());
-					//WriteAttributeString(writer,"MaximumValue", (string) pf.MaximumValue);
-					//WriteAttributeString(writer,"MinimumValue", (string) pf.MinimumValue);
+					WriteParameterSettingAttribute(writer, pf.Name, "MaximumValue", () => FormatParameterValue(pf.MaximumValue));
+					WriteParameterSettingAttribute(writer, pf.Name, "MinimumValue", () => FormatParameterValue(pf.MinimumValue));
 					WriteAttributeString(writer, "Name", pf.Name);
 					WriteAttributeString(writer, "NumberOfBytes", pf.NumberOfBytes.ToString(CultureInfo.InvariantCulture));
 					WriteAttributeString(writer, "ParameterFieldName", pf.ParameterFieldName);
@@ -647,12 +834,7 @@ namespace RptToXml
 						{
 							writer.WriteStartElement("ParameterDefaultValue");
 							WriteAttributeString(writer, "Description", pv.Description);
-							// TODO: document dynamic parameters
-							if (!pv.IsRange)
-							{
-								ParameterDiscreteValue pdv = (ParameterDiscreteValue)pv;
-								WriteAttributeString(writer, "Value", pdv.Value.ToString());
-							}
+							WriteParameterValueAttributes(writer, pv);
 							writer.WriteEndElement();
 						}
 					}
@@ -663,11 +845,10 @@ namespace RptToXml
 					{
 						if (ddm_pf.InitialValues.Count > 0)
 						{
-							foreach (CRDataDefModel.ParameterFieldValue pv in ddm_pf.InitialValues)
+							foreach (object pv in ddm_pf.InitialValues)
 							{
 								writer.WriteStartElement("ParameterInitialValue");
-								CRDataDefModel.ParameterFieldDiscreteValue pdv = (CRDataDefModel.ParameterFieldDiscreteValue)pv;
-								WriteAttributeString(writer, "Value", pdv.Value.ToString());
+								WriteParameterValueAttributes(writer, pv);
 								writer.WriteEndElement();
 							}
 						}
@@ -681,28 +862,28 @@ namespace RptToXml
 						{
 							writer.WriteStartElement("ParameterCurrentValue");
 							WriteAttributeString(writer, "Description", pv.Description);
-							// TODO: document dynamic parameters
-							if (!pv.IsRange)
-							{
-								ParameterDiscreteValue pdv = (ParameterDiscreteValue)pv;
-								WriteAttributeString(writer, "Value", pdv.Value.ToString());
-							}
+							WriteParameterValueAttributes(writer, pv);
 							writer.WriteEndElement();
 						}
 					}
 					writer.WriteEndElement();
+
+					if (ddm_pf != null)
+					{
+						GetParameterPrompting(ddm_pf, pf.Name, writer);
+					}
 				}
 
 			}
 			else if (fo is RunningTotalFieldDefinition rtf)
 			{
                 writer.WriteStartElement("RunningTotalFieldDefinition");
-				//WriteAttributeString(writer,"EvaluationConditionType", rtf.EvaluationCondition);
+				WriteRunningTotalConditionAttribute(writer, "EvaluationCondition", rtf.EvaluationConditionType, () => rtf.EvaluationCondition);
 				WriteAttributeString(writer, "EvaluationConditionType", rtf.EvaluationConditionType.ToString());
 				WriteAttributeString(writer, "FormulaName", rtf.FormulaName);
 				if (rtf.Group != null)
                 {
-                    WriteAttributeString(writer, "Group", rtf.Group.ToString());
+                    WriteAttributeString(writer, "Group", GetGroupReference(rtf.Group));
                 }
 
                 WriteAttributeString(writer, "Kind", rtf.Kind.ToString());
@@ -710,6 +891,7 @@ namespace RptToXml
 				WriteAttributeString(writer, "NumberOfBytes", rtf.NumberOfBytes.ToString(CultureInfo.InvariantCulture));
 				WriteAttributeString(writer, "Operation", rtf.Operation.ToString());
 				WriteAttributeString(writer, "OperationParameter", rtf.OperationParameter.ToString(CultureInfo.InvariantCulture));
+				WriteRunningTotalConditionAttribute(writer, "ResetCondition", rtf.ResetConditionType, () => rtf.ResetCondition);
 				WriteAttributeString(writer, "ResetConditionType", rtf.ResetConditionType.ToString());
 
 				if (rtf.SecondarySummarizedField != null)
@@ -752,9 +934,10 @@ namespace RptToXml
 
 				if (sf.Group != null)
                 {
-                    WriteAttributeString(writer, "Group", sf.Group.ToString());
+                    WriteOptionalAttribute(writer, "Group", "Group of a summary field", () => GetGroupReference(sf.Group));
                 }
 
+				WriteOptionalAttribute(writer, "IsPercentageSummary", "IsPercentageSummary of a summary field", () => sf.IsPercentageSummary.ToString());
                 WriteAttributeString(writer, "Kind", sf.Kind.ToString());
 				WriteAttributeString(writer, "Name", sf.Name);
 				WriteAttributeString(writer, "NumberOfBytes", sf.NumberOfBytes.ToString(CultureInfo.InvariantCulture));
@@ -762,31 +945,370 @@ namespace RptToXml
 				WriteAttributeString(writer, "OperationParameter", sf.OperationParameter.ToString(CultureInfo.InvariantCulture));
 				if (sf.SecondarySummarizedField != null)
                 {
-                    WriteAttributeString(writer, "SecondarySummarizedField", sf.SecondarySummarizedField.ToString());
+                    WriteOptionalAttribute(writer, "SecondarySummarizedField", "SecondarySummarizedField of a summary field", () => GetFieldReference(sf.SecondarySummarizedField));
                 }
 
-                WriteAttributeString(writer, "SummarizedField", sf.SummarizedField.ToString());
+                WriteOptionalAttribute(writer, "SummarizedField", "SummarizedField of a summary field", () => GetFieldReference(sf.SummarizedField));
 				WriteAttributeString(writer, "ValueType", sf.ValueType.ToString());
 
 			}
 			writer.WriteEndElement();
 		}
 
-		private CRDataDefModel.ParameterField GetRASDDMParameterFieldObject(string fieldName, ReportDocument report)
+		// Engine fields and groups don't override ToString(), so reference them the way the rest of the dump does:
+		// a field by its formula name (e.g. {Orders.Amount}), a group by its condition field's formula name
+		// (as in DataDefinition/Groups/Group/@ConditionField).
+		private static string GetFieldReference(FieldDefinition field)
+		{
+			return field?.FormulaName;
+		}
+
+		private static string GetGroupReference(Group group)
+		{
+			return group?.ConditionField?.FormulaName;
+		}
+
+		// Names a report in an error message; the main report's Name is empty.
+		private static string DescribeReport(ReportDocument report)
+		{
+			return report.IsSubreport ? $"subreport '{report.Name}'" : "the main report";
+		}
+
+		// RunningTotalFieldDefinition.EvaluationCondition/ResetCondition is, per its *ConditionType: NoCondition -> null,
+		// OnChangeOfField -> FieldDefinition, OnChangeOfGroup -> Group, OnFormula -> the formula text (string).
+		// A failed read is reported and omits the attribute. The engine's conversion throws NotSupportedException for a RAS object it does not
+		// map and NotImplementedException for a field kind it does not map (e.g. a group name field), and COM interop raises a
+		// failing RAS getter as COMException or, for standard HRESULTs, as NotImplementedException, ArgumentException,
+		// InvalidCastException and others, so any exception counts as a failed read.
+		[HandleProcessCorruptedStateExceptions]
+		private static void WriteRunningTotalConditionAttribute(XmlWriter writer, string name, RunningTotalCondition conditionType, Func<object> getCondition)
+		{
+			if (conditionType == RunningTotalCondition.NoCondition)
+			{
+				return;
+			}
+
+			string value;
+			try
+			{
+				object condition = getCondition();
+				switch (condition)
+				{
+					case string formulaText:
+						value = formulaText;
+						break;
+					case FormulaFieldDefinition formula when conditionType == RunningTotalCondition.OnFormula:
+						value = formula.Text;
+						break;
+					case FieldDefinition field:
+						value = GetFieldReference(field);
+						break;
+					case Group group:
+						value = GetGroupReference(group);
+						break;
+					default:
+						value = null;
+						break;
+				}
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine($"Error reading {name} of a running total field, {e.Message}");
+				return;
+			}
+
+			if (!String.IsNullOrEmpty(value))
+			{
+				WriteAttributeString(writer, name, value);
+			}
+		}
+
+		// The main report's parameters include those of its subreports, whose ReportName is the subreport's name (it is empty
+		// for the main report's own), so a parameter is looked up in the report that it belongs to.
+		[HandleProcessCorruptedStateExceptions]
+		private CRDataDefModel.ParameterField GetRASDDMParameterFieldObject(ParameterFieldDefinition pf, ReportDocument report)
 		{
 			CRDataDefModel.ParameterField rdm;
 			if (report.IsSubreport)
 			{
 				var subrptClientDoc = _report.ReportClientDocument.SubreportController.GetSubreport(report.Name);
-				rdm = subrptClientDoc.DataDefController.DataDefinition.ParameterFields.FindField(fieldName,
+				rdm = subrptClientDoc.DataDefController.DataDefinition.ParameterFields.FindField(pf.Name,
 					CRDataDefModel.CrFieldDisplayNameTypeEnum.crFieldDisplayNameName) as CRDataDefModel.ParameterField;
+			}
+			else if (!String.IsNullOrEmpty(pf.ReportName))
+			{
+				// Earlier versions of this tool looked such a parameter up in the main report. If the lookup in the subreport
+				// fails, the parameter is written without the RAS settings, as when it is not found, and the failure reported.
+				try
+				{
+					var subrptClientDoc = _report.ReportClientDocument.SubreportController.GetSubreport(pf.ReportName);
+					rdm = subrptClientDoc.DataDefController.DataDefinition.ParameterFields.FindField(pf.Name,
+						CRDataDefModel.CrFieldDisplayNameTypeEnum.crFieldDisplayNameName) as CRDataDefModel.ParameterField;
+				}
+				catch (Exception e)
+				{
+					Console.Error.WriteLine($"Error reading parameter '{pf.Name}' of subreport '{pf.ReportName}', {e.Message}");
+					rdm = null;
+				}
 			}
 			else
 			{
-				rdm = _rcd.DataDefController.DataDefinition.ParameterFields.FindField(fieldName,
+				rdm = _rcd.DataDefController.DataDefinition.ParameterFields.FindField(pf.Name,
 					CRDataDefModel.CrFieldDisplayNameTypeEnum.crFieldDisplayNameName) as CRDataDefModel.ParameterField;
 			}
 			return rdm;
+		}
+
+		// Prompting settings read from the RAS parameter object, including what makes a parameter dynamic or cascading. The engine's
+		// ParameterFieldDefinition exposes none of them except the attribute bag (as a Hashtable converted from the same bag), and
+		// RAS IsShownOnPanel / IsEditableOnPanel are not written because ParameterFieldUsage already shows them.
+		// The values a dynamic prompt offers come from the data source at prompt time and are not dumped. The definition of its
+		// list of values (data source, value and description fields) is stored in the report (the PromptManager stream) and is
+		// NOT dumped either: the SDK declares types for it (ReportSource.GetParamPromptingInfo, Prompting.ILOVDataSource,
+		// IPromptGroup), but whether they work on a report loaded from a file without a database logon is untested.
+		// Dumped: the field the values are browsed from, the parent parameters of a cascading prompt, the function supplying
+		// initial values, and the parameter's attribute bag.
+		// Each setting is read on its own and in full before it is written (see TryReadParameterSetting), so a getter that is not
+		// supported for this kind of parameter only leaves out its own attribute or element, never an empty or half-written one.
+		private void GetParameterPrompting(CRDataDefModel.ParameterField ddm_pf, string parameterName, XmlWriter writer)
+		{
+			writer.WriteStartElement("ParameterPrompting");
+
+			WriteParameterSettingAttribute(writer, parameterName, "AllowHierarchyValues", () => ddm_pf.AllowHierarchyValues.ToString());
+			WriteParameterSettingAttribute(writer, parameterName, "BrowseField", () =>
+			{
+				string formulaForm = ddm_pf.BrowseField?.FormulaForm;
+				return string.IsNullOrEmpty(formulaForm) ? null : formulaForm;
+			});
+			WriteParameterSettingAttribute(writer, parameterName, "IsDataFoundationParameter", () => ddm_pf.IsDataFoundationParameter.ToString());
+			WriteParameterSettingAttribute(writer, parameterName, "KeepLastValueSelected", () => ddm_pf.KeepLastValueSelected.ToString());
+
+			// cascading prompt: the parameters answered before this one offers its list of values, in their stored order
+			string[] prerequisiteNames = TryReadParameterSetting(parameterName, "DirectPrerequisiteParameterNames",
+				() => ddm_pf.DirectPrerequisiteParameterNames?.Cast<string>().ToArray() ?? new string[0]);
+			if (prerequisiteNames != null)
+			{
+				writer.WriteStartElement("DirectPrerequisiteParameters");
+				foreach (string prerequisiteName in prerequisiteNames)
+				{
+					writer.WriteStartElement("DirectPrerequisiteParameter");
+					WriteAttributeString(writer, "Name", prerequisiteName);
+					writer.WriteEndElement();
+				}
+				writer.WriteEndElement();
+			}
+
+			// name, syntax and text; RAS may return an empty function rather than none, which is left out like a missing one
+			Tuple<string, string, string> initialValuesFunction = TryReadParameterSetting(parameterName, "InitialValuesFunction", () =>
+			{
+				CRDataDefModel.CustomFunction function = ddm_pf.InitialValuesFunction;
+				return function == null || (string.IsNullOrEmpty(function.Name) && string.IsNullOrEmpty(function.Text))
+					? null
+					: Tuple.Create(function.Name, function.Syntax.ToString(), function.Text);
+			});
+			if (initialValuesFunction != null)
+			{
+				writer.WriteStartElement("InitialValuesFunction");
+				WriteAttributeString(writer, "Name", initialValuesFunction.Item1);
+				WriteAttributeString(writer, "Syntax", initialValuesFunction.Item2);
+				writer.WriteStartElement("Text"); // an element so line breaks are literal
+				WriteString(writer, initialValuesFunction.Item3);
+				writer.WriteEndElement();
+				writer.WriteEndElement();
+			}
+
+			PropertyBagEntry[] attributes = TryReadParameterSetting(parameterName, "Attributes", () =>
+			{
+				CRDataDefModel.PropertyBag bag = ddm_pf.Attributes;
+				return bag == null ? new PropertyBagEntry[0] : ReadPropertyBag(bag);
+			});
+			if (attributes != null)
+			{
+				writer.WriteStartElement("ParameterAttributes");
+				WritePropertyBagEntries(writer, "ParameterAttribute", attributes);
+				writer.WriteEndElement();
+			}
+
+			writer.WriteEndElement();
+		}
+
+		// One entry of a RAS property bag, copied out of RAS so that writing it reads nothing more from RAS.
+		private sealed class PropertyBagEntry
+		{
+			public string Name;
+			public string Value; // formatted by FormatParameterValue; null when missing, left out (see ReadPropertyBag) or for a nested bag
+			public PropertyBagEntry[] NestedEntries; // a nested bag, else null
+		}
+
+		private static readonly System.Text.RegularExpressions.Regex PasswordKeyRegex =
+			new System.Text.RegularExpressions.Regex("password|passwd|pwd", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+		private static readonly System.Text.RegularExpressions.Regex PasswordValueRegex =
+			new System.Text.RegularExpressions.Regex("\\b(password|pwd)\\s*=", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+		// Sorted by name so the output does not depend on the bag's internal order. A nested bag becomes nested entries.
+		// The value is left out when the name looks like a password or the value contains one (as in "...;PWD=x;").
+		private static PropertyBagEntry[] ReadPropertyBag(CRDataDefModel.PropertyBag bag)
+		{
+			return bag.PropertyIDs.Cast<string>()
+				.OrderBy(id => id, StringComparer.Ordinal)
+				.Select(id =>
+				{
+					object value = bag[id];
+					var nestedBag = value as CRDataDefModel.PropertyBag;
+					string text = nestedBag == null ? FormatParameterValue(value) : null;
+					if (text != null && (PasswordKeyRegex.IsMatch(id) || PasswordValueRegex.IsMatch(text)))
+					{
+						text = null;
+					}
+					return new PropertyBagEntry
+					{
+						Name = id,
+						Value = text,
+						NestedEntries = nestedBag == null ? null : ReadPropertyBag(nestedBag),
+					};
+				})
+				.ToArray();
+		}
+
+		// Reads a connection property whose value is itself a property bag (QE_LogonProperties, the logon settings of the
+		// connection), which earlier versions of this tool wrote as "System.__ComObject". Returns null for any other value,
+		// and when the bag cannot be read (reported), so that the property is written as an attribute as before.
+		[HandleProcessCorruptedStateExceptions]
+		private static PropertyBagEntry TryReadNestedProperty(string tableAlias, string propertyId, object value)
+		{
+			try
+			{
+				var bag = value as CRDataDefModel.PropertyBag;
+				return bag == null ? null : new PropertyBagEntry { Name = propertyId, NestedEntries = ReadPropertyBag(bag) };
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine($"Error reading {propertyId} of table '{tableAlias}', {e.Message}");
+				return null;
+			}
+		}
+
+		private static void WritePropertyBagEntries(XmlWriter writer, string elementName, PropertyBagEntry[] entries)
+		{
+			foreach (PropertyBagEntry entry in entries)
+			{
+				writer.WriteStartElement(elementName);
+				WriteAttributeString(writer, "Name", entry.Name);
+				if (entry.NestedEntries != null)
+				{
+					WritePropertyBagEntries(writer, elementName, entry.NestedEntries);
+				}
+				else if (entry.Value != null)
+				{
+					WriteAttributeString(writer, "Value", entry.Value);
+				}
+				writer.WriteEndElement();
+			}
+		}
+
+		// Reads one setting of a parameter in full, or returns null when the read fails. A RAS getter can fail for a kind of
+		// parameter it does not support, and COM interop raises that as COMException or, for standard HRESULTs, as
+		// NotImplementedException, ArgumentException, InvalidCastException and others, so any exception counts as a failed read.
+		// Nothing is written while reading, so a failure cannot leave an element half-written or drop the remaining parameters.
+		[HandleProcessCorruptedStateExceptions]
+		private T TryReadParameterSetting<T>(string parameterName, string setting, Func<T> read) where T : class
+		{
+			try
+			{
+				return read();
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine($"Error reading {setting} of parameter '{parameterName}', {e.Message}");
+				return null;
+			}
+		}
+
+		// Writes the attribute unless its value is missing (null) or cannot be read.
+		private void WriteParameterSettingAttribute(XmlWriter writer, string parameterName, string name, Func<string> read)
+		{
+			string value = TryReadParameterSetting(parameterName, name, read);
+			if (value != null)
+			{
+				WriteAttributeString(writer, name, value);
+			}
+		}
+
+		// Writes one parameter value, from the engine (Shared.ParameterValue) or from RAS (ISCRValue): Value for a discrete
+		// value; StartValue/EndValue and the bound types for a range value. Discrete is tested before range, in the order the
+		// engine tests RAS values when it converts them.
+		private static void WriteParameterValueAttributes(XmlWriter writer, object parameterValue)
+		{
+			switch (parameterValue)
+			{
+				case ParameterDiscreteValue discrete:
+					WriteParameterValueAttribute(writer, "Value", discrete.Value);
+					break;
+				case ParameterRangeValue range:
+					WriteParameterRangeAttributes(writer, range.StartValue, range.LowerBoundType, range.EndValue, range.UpperBoundType);
+					break;
+				case CRDataDefModel.ISCRParameterFieldDiscreteValue rasDiscrete:
+					WriteParameterValueAttribute(writer, "Value", rasDiscrete.Value);
+					break;
+				case CRDataDefModel.ISCRParameterFieldRangeValue rasRange:
+					// CrRangeValueBoundTypeEnum and RangeBoundType share their values (no bound / exclusive / inclusive = 0 / 1 / 2),
+					// so RAS ranges are written with the same bound names as engine ranges
+					WriteParameterRangeAttributes(writer, rasRange.BeginValue, (RangeBoundType)rasRange.LowerBoundType, rasRange.EndValue, (RangeBoundType)rasRange.UpperBoundType);
+					break;
+				case CRDataDefModel.ISCRConstantValue rasConstant:
+					WriteParameterValueAttribute(writer, "Value", rasConstant.Value);
+					break;
+			}
+		}
+
+		// An unbounded end has no value (the engine nulls it), so StartValue/EndValue are written only for bounded ends.
+		private static void WriteParameterRangeAttributes(XmlWriter writer, object startValue, RangeBoundType lowerBoundType, object endValue, RangeBoundType upperBoundType)
+		{
+			if (lowerBoundType != RangeBoundType.NoBound)
+			{
+				WriteParameterValueAttribute(writer, "StartValue", startValue);
+			}
+			if (upperBoundType != RangeBoundType.NoBound)
+			{
+				WriteParameterValueAttribute(writer, "EndValue", endValue);
+			}
+			WriteAttributeString(writer, "LowerBoundType", lowerBoundType.ToString());
+			WriteAttributeString(writer, "UpperBoundType", upperBoundType.ToString());
+		}
+
+		// Omits the attribute when the value is missing (see FormatParameterValue).
+		private static void WriteParameterValueAttribute(XmlWriter writer, string name, object value)
+		{
+			string text = FormatParameterValue(value);
+			if (text != null)
+			{
+				WriteAttributeString(writer, name, text);
+			}
+		}
+
+		// Formats a parameter value independently of the current culture, so the XML is the same on every machine.
+		// Strings and booleans come out as ToString() always gave them, numbers use the invariant culture, and dates/times use
+		// ISO 8601 "yyyy-MM-ddTHH:mm:ss" with fractional seconds only when present: culture-independent, sorts chronologically
+		// as text, round-trips through DateTime.Parse with the invariant culture, and involves no time-zone conversion.
+		// Returns null for a missing value (null or DBNull) or one without a text form (e.g. a COM object) rather than a type name.
+		private static string FormatParameterValue(object value)
+		{
+			switch (value)
+			{
+				case null:
+				case DBNull _:
+					return null;
+				case string text:
+					return text;
+				case DateTime dateTime:
+					return dateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture);
+				case IConvertible convertible:
+					return convertible.ToString(CultureInfo.InvariantCulture);
+				case IFormattable formattable:
+					return formattable.ToString(null, CultureInfo.InvariantCulture);
+				default:
+					return null;
+			}
 		}
 
 		private CRDataDefModel.FormulaField GetRASDDMFormulaFieldObject(string fieldName, ReportDocument report)
@@ -806,7 +1328,7 @@ namespace RptToXml
 			return rdm;
 		}
 
-		private void GetAreaFormat(Area area, XmlWriter writer)
+		private void GetAreaFormat(Area area, ReportDocument report, XmlWriter writer)
 		{
 			writer.WriteStartElement("AreaFormat");
 
@@ -827,6 +1349,16 @@ namespace RptToXml
 				WriteAttributeString(writer, "VisibleGroupNumberPerPage", gaf.VisibleGroupNumberPerPage.ToString());
 				writer.WriteEndElement();
 			}
+
+			WriteOptional(writer, $"condition formulas of area {area.Name}", w =>
+			{
+				CRReportDefModel.ISCRArea rdmArea = GetRASRDMAreaObjectFromCRENGAreaObject(area.Name, report);
+				if (rdmArea != null)
+				{
+					GetAreaFormatConditionFormulas(rdmArea, w);
+				}
+			});
+
 			writer.WriteEndElement();
 
 		}
@@ -966,7 +1498,7 @@ namespace RptToXml
 
 				if ((ShowFormatTypes & FormatTypes.AreaFormat) == FormatTypes.AreaFormat)
                 {
-                    GetAreaFormat(area, writer);
+                    GetAreaFormat(area, report, writer);
                 }
 
                 GetSections(area, report, writer);
@@ -1056,7 +1588,7 @@ namespace RptToXml
                     var rasrdmFh = (CRReportDefModel.FieldHeadingObject)rasrdm_ro;
 					WriteAttributeString(writer, "FieldObjectName", fh.FieldObjectName);
 					WriteAttributeString(writer, "MaxNumberOfLines", rasrdmFh.MaxNumberOfLines.ToString());
-					writer.WriteElementString("Text", fh.Text);
+					WriteElementString(writer, "Text", fh.Text);
 
 					if ((ShowFormatTypes & FormatTypes.Color) == FormatTypes.Color)
                     {
@@ -1095,7 +1627,7 @@ namespace RptToXml
                     var rasrdmTobj = (CRReportDefModel.TextObject)rasrdm_ro;
 
 					WriteAttributeString(writer, "MaxNumberOfLines", rasrdmTobj.MaxNumberOfLines.ToString());
-					writer.WriteElementString("Text", tobj.Text);
+					WriteElementString(writer, "Text", tobj.Text);
 
 					if ((ShowFormatTypes & FormatTypes.Color) == FormatTypes.Color)
                     {

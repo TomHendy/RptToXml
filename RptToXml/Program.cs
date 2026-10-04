@@ -32,9 +32,7 @@ namespace RptToXml
             var stdoutOption = new Option<bool>(
                 name: "--stdout",
                 getDefaultValue: () => false,
-                description: "Write the XML to console output. Suppresses all other output text (status, warnings, etc). Not valid with outputfilename.");
-
-            Trace.Listeners.Add(new TextWriterTraceListener(Console.Out));
+                description: "Write the XML to standard output as UTF-8, without the FileName attribute. Progress text is suppressed; errors go to standard error. Not valid with outputfilename.");
 
             int exitCode = 0;
             var command = new RootCommand("RPT2XML");
@@ -50,9 +48,11 @@ namespace RptToXml
                 outputFilenameArg,
                 ignoreErrorsOption, stdoutOption);
 
-            command.Invoke(args);
+            // Invoke returns non-zero for parse errors and for exceptions caught by its default exception handler
+            // (a failing file without --ignore-errors); Execute's result covers everything else.
+            int invokeExitCode = command.Invoke(args);
 
-            return exitCode;
+            return invokeExitCode != 0 ? invokeExitCode : exitCode;
 
         }
 
@@ -62,19 +62,25 @@ namespace RptToXml
             bool ignoreErrors,
             bool stdOut)
         {
+            // Progress goes to stdout via Trace; with --stdout, stdout carries only the XML.
+            if (!stdOut)
+            {
+                Trace.Listeners.Add(new TextWriterTraceListener(Console.Out));
+            }
+
             List<string> rptPaths = FindRptPaths(input);
             if (rptPaths.Count == 0)
             {
                 string errorMessage = input.Equals("-r", StringComparison.OrdinalIgnoreCase)
-                    ? "No *.RPT files found rescursively in current directory."
+                    ? "No *.RPT files found recursively in current directory."
                     : $"No input files matched {input}.";
-				Console.WriteLine(errorMessage);
+				Console.Error.WriteLine(errorMessage);
                 return 1;
             }
 
             if (rptPaths.Count > 1 && !string.IsNullOrEmpty(outputFilename))
             {
-                Console.WriteLine($"outputfilename is only allowed with single input file.");
+                Console.Error.WriteLine($"outputfilename is only allowed with single input file.");
                 return 1;
             }
 
@@ -86,8 +92,8 @@ namespace RptToXml
                 {
                     if (!File.Exists(rptPath))
                     {
-                        Console.WriteLine($"{rptPath} does not exist.");
-                        exitCode = 1;
+                        Console.Error.WriteLine($"{rptPath} does not exist.");
+                        System.Threading.Interlocked.Exchange(ref exitCode, 1);
                         return;
                     }
 
@@ -117,7 +123,8 @@ namespace RptToXml
                     {
                         if (ignoreErrors)
                         {
-                            Trace.WriteLine(ex.Message);
+                            Console.Error.WriteLine($"{rptPath}: {ex.Message}");
+                            System.Threading.Interlocked.Exchange(ref exitCode, 1);
                         }
                         else
                         {
@@ -139,7 +146,9 @@ namespace RptToXml
 
             if (input.Contains("*"))
             {
-                return Directory.GetFiles(Path.GetDirectoryName(input) ?? ".", Path.GetFileName(input)).ToList();
+                // a bare pattern such as *.rpt has an empty directory name
+                string directory = Path.GetDirectoryName(input);
+                return Directory.GetFiles(string.IsNullOrEmpty(directory) ? "." : directory, Path.GetFileName(input)).ToList();
             }
 
             return new List<string> { input };

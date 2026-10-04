@@ -2,13 +2,15 @@
 
 Dumps a Crystal Reports RPT file to XML. Useful for diffs.
 
-Binary releases available on the [Releases](https://github.com/ajryan/RptToXml/releases) page.
+Binary releases available on the [Releases](https://github.com/TomHendy/RptToXml/releases) page.
+
+Fork of [ajryan/RptToXml](https://github.com/ajryan/RptToXml).
 
 Ported to C# from the [original VB project](http://code.google.com/p/rpttoxml/)
 
 ## Running
 
-Download the latest [release](https://github.com/ajryan/RptToXml/releases).
+Download the latest [release](https://github.com/TomHendy/RptToXml/releases/latest).
 
 RptToXml references Crystal Reports assemblies. The easiest way to get them onto a development machine is to install the Crystal Reports Runtime from an MSI downloaded from [this page](https://www.sap.com/cmp/td/sap-crystal-reports-visual-studio-trial.html).
 
@@ -62,3 +64,15 @@ To check a build against an earlier one, run [scripts/Compare-Samples.ps1](scrip
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\Compare-Samples.ps1 -Baseline path\to\old\RptToXml.exe -Candidate RptToXml\bin\Debug\RptToXml.exe
 ```
+
+## Releases
+
+GitHub Actions builds the releases (`.github/workflows/release.yml`). Push a version tag and it builds `Release|x86` on Windows, stamps the tag's version into the assembly, and attaches a zip of the build to a new release:
+
+```sh
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+Running the workflow by hand from the Actions tab builds without releasing; the zip is attached to the run instead.
+

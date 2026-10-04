@@ -1,0 +1,59 @@
+name: Build and release
+
+# Push a version tag (v1.2.0) to build Release|x86 on Windows, stamp that
+# version into the assembly, and publish the zipped bin\Release folder as a
+# GitHub release. Run it by hand (Actions → Build and release → Run workflow)
+# to build without releasing; the zip is then attached to the run as an artifact.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version from tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $v = '${{ github.ref_name }}'.TrimStart('v')
+          if ($v -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "Tag must look like v1.2.3 (got ${{ github.ref_name }})" }
+          $f = 'RptToXml/Properties/AssemblyInfo.cs'
+          (Get-Content $f) -replace 'Assembly(File)?Version\("[^"]*"\)', "Assembly`$1Version(`"$v`")" | Set-Content $f
+          Select-String -Path $f -Pattern 'Version\('
+
+      - uses: microsoft/setup-msbuild@v2
+      - uses: nuget/setup-nuget@v2
+
+      - name: Restore
+        run: nuget restore RptToXml/RptToXml.sln
+
+      - name: Build
+        run: msbuild RptToXml/RptToXml.sln /p:Configuration=Release /p:Platform=x86 /m /v:minimal
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $suffix = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { '${{ github.sha }}'.Substring(0, 7) }
+          $zip = "RptToXml-$suffix.zip"
+          Compress-Archive -Path RptToXml/bin/Release/* -DestinationPath $zip
+          "ZIP=$zip" >> $env:GITHUB_ENV
+          Get-Item $zip | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RptToXml
+          path: ${{ env.ZIP }}
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
